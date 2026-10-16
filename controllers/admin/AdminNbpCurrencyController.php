@@ -55,9 +55,21 @@ class AdminNbpCurrencyController extends ModuleAdminController
     {
         $autoUpdate  = (int) Tools::getValue('auto_update', 0);
         $updatePsCur = (int) Tools::getValue('update_ps_currency', 0);
+        $shopIds     = Tools::getValue('shops', []);
 
-        Configuration::updateValue(NbpCurrency::CONFIG_KEY_AUTO_UPDATE, $autoUpdate);
-        Configuration::updateValue(NbpCurrency::CONFIG_KEY_UPDATE_PS_CUR, $updatePsCur);
+        $shopIds = array_values(array_intersect(
+            array_map('intval', is_array($shopIds) ? $shopIds : []),
+            array_map('intval', Shop::getShops(false, null, true))
+        ));
+
+        if ($updatePsCur && !$shopIds) {
+            $this->errors[] = $this->l('Zaznacz co najmniej jeden sklep, w którym mają być aktualizowane kursy.');
+            return;
+        }
+
+        NbpCurrency::setConfig(NbpCurrency::CONFIG_KEY_AUTO_UPDATE, $autoUpdate);
+        NbpCurrency::setConfig(NbpCurrency::CONFIG_KEY_UPDATE_PS_CUR, $updatePsCur);
+        NbpCurrency::setConfig(NbpCurrency::CONFIG_KEY_SHOPS, implode(',', $shopIds));
 
         $this->confirmations[] = $this->l('Ustawienia zostały zapisane.');
     }
@@ -120,7 +132,8 @@ class AdminNbpCurrencyController extends ModuleAdminController
 
     private function processRefreshRate(): void
     {
-        $result = $this->module->fetchAll();
+        // Ręczne pobranie zawsze zapisuje wynik do logu
+        $result = $this->module->fetchAll(true);
 
         if (!$result['success'] && empty($result['currencies'])) {
             $this->errors[] = $result['message'] ?? $this->l('Błąd pobierania kursów.');
@@ -149,16 +162,36 @@ class AdminNbpCurrencyController extends ModuleAdminController
 
     private function getTemplateVars(): array
     {
-        $cronToken = Configuration::get(NbpCurrency::CONFIG_KEY_CRON_TOKEN);
+        $cronToken = NbpCurrency::getConfig(NbpCurrency::CONFIG_KEY_CRON_TOKEN);
         $baseUrl   = Tools::getShopDomainSsl(true) . __PS_BASE_URI__;
         $cronUrl   = $baseUrl . 'modules/nbpcurrency/cron/update.php?token=' . $cronToken;
 
         $trackedRaw = $this->module->getTrackedCurrencies(false);
 
+        $targetShopIds = NbpCurrency::getTargetShopIds();
+        $shops = [];
+        foreach (Shop::getShops(false, null, true) as $idShop) {
+            $shop    = Shop::getShop((int) $idShop);
+            $shops[] = [
+                'id_shop'     => (int) $idShop,
+                'name'        => $shop ? $shop['name'] : '#' . $idShop,
+                'default_iso' => NbpCurrency::getShopDefaultIso((int) $idShop),
+                'selected'    => in_array((int) $idShop, $targetShopIds, true),
+            ];
+        }
+
         $tracked = [];
         foreach ($trackedRaw as $row) {
-            $log        = $this->module->getLatestLog((int) $row['id_currency']);
-            $psCurrency = new Currency((int) $row['id_currency']);
+            $log = $this->module->getLatestLog((int) $row['id_currency']);
+
+            // conversion_rate w każdym sklepie (ps_currency_shop)
+            $shopRates = [];
+            foreach ($shops as $shop) {
+                $rate = NbpCurrency::getShopCurrencyRate($row['iso_code'], $shop['id_shop']);
+                if ($rate) {
+                    $shopRates[] = ['name' => $shop['name'], 'rate' => $rate['conversion_rate']];
+                }
+            }
 
             $tracked[] = [
                 'id_tracked'         => (int) $row['id_tracked'],
@@ -169,7 +202,7 @@ class AdminNbpCurrencyController extends ModuleAdminController
                 'markup'             => $row['markup'],
                 'active'             => (bool) $row['active'],
                 'rate_value'         => $log['rate_value'] ?? null,
-                'ps_conversion_rate' => Validate::isLoadedObject($psCurrency) ? $psCurrency->conversion_rate : null,
+                'shop_rates'         => $shopRates,
                 'last_update'        => $log['fetched_at'] ?? null,
                 'last_success'       => $log ? (bool) $log['success'] : null,
                 'last_message'       => $log['message'] ?? null,
@@ -185,17 +218,22 @@ class AdminNbpCurrencyController extends ModuleAdminController
             $available[] = $currency;
         }
 
-        $defaultCurrency = Currency::getDefaultCurrency();
-        $defaultIso      = $defaultCurrency ? $defaultCurrency->iso_code : '?';
-        $defaultTracked  = $defaultIso === 'PLN' || in_array($defaultIso, array_column($trackedRaw, 'iso_code'), true);
+        // Sklepy z walutą domyślną inną niż PLN, której nie śledzimy – nie da się w nich przeliczyć kursów
+        $trackedIsos      = array_column($trackedRaw, 'iso_code');
+        $untrackedDefault = [];
+        foreach ($shops as $shop) {
+            if ($shop['selected'] && $shop['default_iso'] !== 'PLN' && !in_array($shop['default_iso'], $trackedIsos, true)) {
+                $untrackedDefault[] = $shop;
+            }
+        }
 
         return [
             'tracked_currencies'   => $tracked,
             'available_currencies' => $available,
-            'auto_update'          => (bool) Configuration::get(NbpCurrency::CONFIG_KEY_AUTO_UPDATE),
-            'update_ps_currency'   => (bool) Configuration::get(NbpCurrency::CONFIG_KEY_UPDATE_PS_CUR),
-            'default_currency'     => $defaultIso,
-            'default_tracked'      => $defaultTracked,
+            'auto_update'          => (bool) NbpCurrency::getConfig(NbpCurrency::CONFIG_KEY_AUTO_UPDATE),
+            'update_ps_currency'   => (bool) NbpCurrency::getConfig(NbpCurrency::CONFIG_KEY_UPDATE_PS_CUR),
+            'shops'                => $shops,
+            'untracked_default'    => $untrackedDefault,
             'cron_url'             => $cronUrl,
             'rate_log'             => $this->module->getRecentLog(20),
             'module_dir'           => $this->module->getPathUri(),

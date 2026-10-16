@@ -9,13 +9,13 @@ function nbpToggleRateType(selectEl, groupEl) {
 }
 </script>
 
-{if !$default_tracked}
+{foreach from=$untracked_default item=shop}
 <div class="alert alert-warning">
     <i class="icon-warning"></i>
-    {l s='Waluta domyślna sklepu to' mod='nbpcurrency'} <strong>{$default_currency}</strong>.
+    {l s='Waluta domyślna sklepu' mod='nbpcurrency'} <strong>{$shop.name|escape:'html':'UTF-8'}</strong> {l s='to' mod='nbpcurrency'} <strong>{$shop.default_iso|escape:'html':'UTF-8'}</strong>.
     {l s='Aby moduł mógł poprawnie przeliczać kursy pozostałych walut, dodaj tę walutę do listy śledzonych poniżej.' mod='nbpcurrency'}
 </div>
-{/if}
+{/foreach}
 
 {* ---- Śledzone waluty ---- *}
 <div class="panel">
@@ -87,11 +87,11 @@ function nbpToggleRateType(selectEl, groupEl) {
                             {/if}
                         </td>
                         <td>
-                            {if $tc.ps_conversion_rate}
-                                {$tc.ps_conversion_rate|string_format:"%.6f"}
-                            {else}
+                            {foreach from=$tc.shop_rates item=sr}
+                                {if count($tc.shop_rates) > 1}<small class="text-muted">{$sr.name|escape:'html':'UTF-8'}:</small> {/if}{$sr.rate|string_format:"%.6f"}<br>
+                            {foreachelse}
                                 <span class="text-muted">{l s='brak danych' mod='nbpcurrency'}</span>
-                            {/if}
+                            {/foreach}
                         </td>
                         <td>
                             {if $tc.last_update}
@@ -247,10 +247,35 @@ function nbpToggleRateType(selectEl, groupEl) {
                         <a class="slide-button btn"></a>
                     </span>
                     <p class="help-block">
-                        {l s='Jeśli wyłączone, moduł tylko pobiera i loguje kursy, bez zapisu do tabeli walut PrestaShop.' mod='nbpcurrency'}
+                        {l s='Jeśli wyłączone, moduł tylko pobiera i loguje kursy, bez zapisu do tabeli walut PrestaShop.' mod='nbpcurrency'}<br>
+                        {l s='Kurs jest zapisywany tylko gdy się zmienił – wywołanie bez nowej tabeli NBP (weekend, święto) niczego nie zapisuje.' mod='nbpcurrency'}
                     </p>
                 </div>
             </div>
+
+            {if count($shops) > 1}
+            <div class="form-group">
+                <label class="control-label col-lg-3">
+                    {l s='Sklepy, w których aktualizować kursy' mod='nbpcurrency'}
+                </label>
+                <div class="col-lg-6">
+                    {foreach from=$shops item=shop}
+                    <div class="checkbox">
+                        <label>
+                            <input type="checkbox" name="shops[]" value="{$shop.id_shop|intval}"
+                                   {if $shop.selected}checked="checked"{/if}>
+                            {$shop.name|escape:'html':'UTF-8'}
+                            <small class="text-muted">({l s='waluta domyślna' mod='nbpcurrency'}: {$shop.default_iso|escape:'html':'UTF-8'})</small>
+                        </label>
+                    </div>
+                    {/foreach}
+                </div>
+            </div>
+            {else}
+                {foreach from=$shops item=shop}
+                <input type="hidden" name="shops[]" value="{$shop.id_shop|intval}">
+                {/foreach}
+            {/if}
 
             <div class="panel-footer">
                 <button type="submit" class="btn btn-default pull-right">

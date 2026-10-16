@@ -2,7 +2,7 @@
 <module>
     <name>nbpcurrency</name>
     <displayName><![CDATA[Kursy walut NBP]]></displayName>
-    <version><![CDATA[1.0.0]]></version>
+    <version><![CDATA[1.1.0]]></version>
     <description><![CDATA[Automatycznie aktualizuje kursy wybranych walut w PrestaShop na podstawie tabel A, B i C Narodowego Banku Polskiego.]]></description>
     <author><![CDATA[breczek1]]></author>
     <tab><![CDATA[pricing_promotion]]></tab>

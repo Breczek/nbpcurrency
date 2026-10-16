@@ -17,6 +17,7 @@ class NbpCurrency extends Module
     const CONFIG_KEY_CRON_TOKEN    = 'NBPCURRENCY_CRON_TOKEN';
     const CONFIG_KEY_AUTO_UPDATE   = 'NBPCURRENCY_AUTO_UPDATE';
     const CONFIG_KEY_UPDATE_PS_CUR = 'NBPCURRENCY_UPDATE_PS_CUR';
+    const CONFIG_KEY_SHOPS         = 'NBPCURRENCY_SHOPS'; // id sklepów (CSV), w których aktualizujemy kursy
 
     const NBP_RATE_URL = 'https://api.nbp.pl/api/exchangerates/rates/%s/%s/?format=json';
 
@@ -53,7 +54,7 @@ class NbpCurrency extends Module
     {
         $this->name          = 'nbpcurrency';
         $this->tab           = 'pricing_promotion';
-        $this->version       = '1.0.0';
+        $this->version       = '1.1.0';
         $this->author        = 'breczek1';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = [
@@ -75,13 +76,19 @@ class NbpCurrency extends Module
 
     public function install(): bool
     {
+        // Instalacja zawsze dla wszystkich sklepów – ustawienia modułu są globalne
+        if (Shop::isFeatureActive()) {
+            Shop::setContext(Shop::CONTEXT_ALL);
+        }
+
         return parent::install()
             && $this->installTab()
             && $this->installDb()
             && $this->registerHook('actionCronJob')
-            && Configuration::updateValue(self::CONFIG_KEY_CRON_TOKEN,    Tools::passwdGen(32))
-            && Configuration::updateValue(self::CONFIG_KEY_AUTO_UPDATE,   1)
-            && Configuration::updateValue(self::CONFIG_KEY_UPDATE_PS_CUR, 1);
+            && self::setConfig(self::CONFIG_KEY_CRON_TOKEN,    Tools::passwdGen(32))
+            && self::setConfig(self::CONFIG_KEY_AUTO_UPDATE,   1)
+            && self::setConfig(self::CONFIG_KEY_UPDATE_PS_CUR, 1)
+            && self::setConfig(self::CONFIG_KEY_SHOPS,         implode(',', Shop::getShops(false, null, true)));
     }
 
     public function uninstall(): bool
@@ -91,7 +98,8 @@ class NbpCurrency extends Module
             && $this->uninstallDb()
             && Configuration::deleteByName(self::CONFIG_KEY_CRON_TOKEN)
             && Configuration::deleteByName(self::CONFIG_KEY_AUTO_UPDATE)
-            && Configuration::deleteByName(self::CONFIG_KEY_UPDATE_PS_CUR);
+            && Configuration::deleteByName(self::CONFIG_KEY_UPDATE_PS_CUR)
+            && Configuration::deleteByName(self::CONFIG_KEY_SHOPS);
     }
 
     private function installTab(): bool
@@ -159,6 +167,59 @@ class NbpCurrency extends Module
     {
         return Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'nbpcurrency_tracked`')
             && Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'nbpcurrency_log`');
+    }
+
+    // -------------------------------------------------------------------------
+    // Konfiguracja – zawsze globalna, niezależnie od kontekstu sklepu
+    // (cron wywołany z domeny sklepu X ustawia kontekst na X)
+    // -------------------------------------------------------------------------
+
+    public static function getConfig(string $key)
+    {
+        return Configuration::getGlobalValue($key);
+    }
+
+    public static function setConfig(string $key, $value): bool
+    {
+        return Configuration::updateGlobalValue($key, $value);
+    }
+
+    /**
+     * @return int[] id sklepów, w których moduł aktualizuje kursy
+     */
+    public static function getTargetShopIds(): array
+    {
+        $existing = array_map('intval', Shop::getShops(false, null, true));
+        $selected = array_map('intval', array_filter(explode(',', (string) self::getConfig(self::CONFIG_KEY_SHOPS))));
+
+        return array_values(array_intersect($selected, $existing));
+    }
+
+    public static function getShopDefaultIso(int $idShop): string
+    {
+        $idDefault = (int) Configuration::get('PS_CURRENCY_DEFAULT', null, Shop::getGroupFromShop($idShop), $idShop);
+
+        return (string) Db::getInstance()->getValue(
+            'SELECT `iso_code` FROM `' . _DB_PREFIX_ . 'currency` WHERE `id_currency` = ' . $idDefault
+        );
+    }
+
+    /**
+     * Aktualny conversion_rate waluty w danym sklepie (null = waluta nieprzypisana do sklepu).
+     *
+     * @return array{id_currency: int, conversion_rate: float}|null
+     */
+    public static function getShopCurrencyRate(string $isoCode, int $idShop): ?array
+    {
+        $row = Db::getInstance()->getRow(
+            'SELECT c.`id_currency`, cs.`conversion_rate`
+             FROM `' . _DB_PREFIX_ . 'currency` c
+             INNER JOIN `' . _DB_PREFIX_ . 'currency_shop` cs
+                ON cs.`id_currency` = c.`id_currency` AND cs.`id_shop` = ' . (int) $idShop . '
+             WHERE c.`iso_code` = \'' . pSQL($isoCode) . '\' AND c.`deleted` = 0'
+        );
+
+        return $row ? ['id_currency' => (int) $row['id_currency'], 'conversion_rate' => (float) $row['conversion_rate']] : null;
     }
 
     // -------------------------------------------------------------------------
@@ -315,9 +376,14 @@ class NbpCurrency extends Module
      * Pobiera kursy wszystkich aktywnych śledzonych walut z NBP, opcjonalnie
      * aktualizuje conversion_rate w PrestaShop i zapisuje historię do logu.
      *
+     * Bez $force: waluta, dla której NBP zwraca tę samą tabelę (data i kurs)
+     * co przy ostatnim udanym pobraniu, nie trafia ponownie do logu, a
+     * conversion_rate zapisywany jest tylko gdy faktycznie się zmienił –
+     * weekendy, święta i tabela B poza środą nie generują zapisów.
+     *
      * @return array{success: bool, message?: string, currencies: array}
      */
-    public function fetchAll(): array
+    public function fetchAll(bool $force = false): array
     {
         $tracked = $this->getTrackedCurrencies(true);
 
@@ -354,6 +420,7 @@ class NbpCurrency extends Module
                 'success'         => true,
                 'rate_value'      => $ratePln,
                 'effective_date'  => $nbpData['effectiveDate'],
+                'unchanged'       => !$force && $this->isSameAsLastLog((int) $row['id_currency'], $nbpData['effectiveDate'], $ratePln),
             ];
         }
 
@@ -366,7 +433,7 @@ class NbpCurrency extends Module
         }
 
         $conversionResults = [];
-        if (Configuration::get(self::CONFIG_KEY_UPDATE_PS_CUR)) {
+        if (self::getConfig(self::CONFIG_KEY_UPDATE_PS_CUR)) {
             $conversionResults = $this->applyConversionRates($ratesPln);
         }
 
@@ -375,14 +442,17 @@ class NbpCurrency extends Module
             $convSuccess    = $conversionResults[$iso]['success'] ?? true;
             $convMessage    = $conversionResults[$iso]['message'] ?? null;
 
-            $this->logResult(
-                $row,
-                $ratesPln[$iso],
-                $conversionRate,
-                $results[$iso]['effective_date'],
-                $convSuccess,
-                $convMessage
-            );
+            // Ta sama tabela NBP co poprzednio i nic się nie zmieniło – nie dublujemy wpisu w logu
+            if (!$convSuccess || !$results[$iso]['unchanged'] || !empty($conversionResults[$iso]['changed'])) {
+                $this->logResult(
+                    $row,
+                    $ratesPln[$iso],
+                    $conversionRate,
+                    $results[$iso]['effective_date'],
+                    $convSuccess,
+                    $convMessage
+                );
+            }
 
             if (!$convSuccess) {
                 $results[$iso]['success'] = false;
@@ -437,6 +507,19 @@ class NbpCurrency extends Module
         ];
     }
 
+    private function isSameAsLastLog(int $idCurrency, string $effectiveDate, float $ratePln): bool
+    {
+        $last = Db::getInstance()->getRow(
+            'SELECT `effective_date`, `rate_value` FROM `' . _DB_PREFIX_ . 'nbpcurrency_log`
+             WHERE `id_currency` = ' . (int) $idCurrency . ' AND `success` = 1
+             ORDER BY `id_log` DESC'
+        );
+
+        return $last
+            && $last['effective_date'] === $effectiveDate
+            && abs((float) $last['rate_value'] - $ratePln) < 0.00005;
+    }
+
     private function computeRateValue(array $nbpData, string $rateType): ?float
     {
         switch ($rateType) {
@@ -456,108 +539,140 @@ class NbpCurrency extends Module
 
     /**
      * Przelicza kursy PLN pobrane z NBP na conversion_rate zapisywane w
-     * PrestaShop i zapisuje je w bazie.
+     * PrestaShop i zapisuje je w każdym wybranym sklepie (ps_currency_shop).
      *
      * NBP zawsze kwotuje względem PLN. Jeśli domyślną walutą sklepu jest PLN,
      * przeliczenie jest bezpośrednie (1 / kurs). Jeśli domyślną walutą jest
      * inna waluta D, potrzebujemy D jako "kotwicy": D musi być na liście
      * śledzonych walut, żeby dało się policzyć kurs krzyżowy pozostałych.
+     * W multistore waluta domyślna jest ustalana osobno dla każdego sklepu.
      *
      * @param array<string, float> $ratesPln nbp_code => kurs PLN (po markupie)
-     * @return array<string, array{success: bool, conversion_rate?: float, message?: string}>
+     * @return array<string, array{success: bool, changed: bool, conversion_rate?: float, message?: string}>
      */
     public function applyConversionRates(array $ratesPln): array
     {
         $out = [];
+        foreach (array_keys($ratesPln) as $iso) {
+            $out[$iso] = ['success' => true, 'changed' => false];
+        }
 
-        $defaultCurrency = Currency::getDefaultCurrency();
-        if (!$defaultCurrency) {
-            $message = $this->l('Nie można określić domyślnej waluty sklepu.');
-            foreach (array_keys($ratesPln) as $iso) {
-                $out[$iso] = ['success' => false, 'message' => $message];
+        $shopIds = self::getTargetShopIds();
+        if (!$shopIds) {
+            foreach (array_keys($out) as $iso) {
+                $out[$iso] = ['success' => false, 'changed' => false, 'message' => $this->l('Nie wybrano żadnego sklepu do aktualizacji kursów.')];
             }
             return $out;
         }
 
-        if ($defaultCurrency->iso_code === 'PLN') {
-            foreach ($ratesPln as $iso => $ratePln) {
-                $out[$iso] = $this->writeCurrencyRateByIso($iso, round(1 / $ratePln, 6));
+        $defaultShopId = (int) Configuration::get('PS_SHOP_DEFAULT');
+        $changed       = [];
+
+        foreach ($shopIds as $idShop) {
+            $shop       = Shop::getShop($idShop);
+            $shopName   = $shop ? $shop['name'] : '#' . $idShop;
+            $defaultIso = self::getShopDefaultIso($idShop);
+
+            $targets = []; // iso => conversion_rate w tym sklepie
+            if ($defaultIso === 'PLN') {
+                foreach ($ratesPln as $iso => $ratePln) {
+                    $targets[$iso] = round(1 / $ratePln, 6);
+                }
+            } elseif (isset($ratesPln[$defaultIso])) {
+                $targets['PLN'] = round($ratesPln[$defaultIso], 6);
+                foreach ($ratesPln as $iso => $ratePln) {
+                    if ($iso !== $defaultIso) { // waluta domyślna ma zawsze conversion_rate = 1, nie ruszamy jej
+                        $targets[$iso] = round($ratesPln[$defaultIso] / $ratePln, 6);
+                    }
+                }
+            } else {
+                $message = sprintf(
+                    $this->l('%1$s: waluta domyślna sklepu (%2$s) nie jest na liście śledzonych walut - dodaj ją, aby moduł mógł przeliczać kursy.'),
+                    $shopName,
+                    $defaultIso
+                );
+                foreach (array_keys($out) as $iso) {
+                    $out[$iso]['success'] = false;
+                    $out[$iso]['message'] = $message;
+                }
+                continue;
             }
-            return $out;
+
+            foreach ($targets as $iso => $conversionRate) {
+                $res = $this->writeShopRate($iso, $idShop, $conversionRate, $idShop === $defaultShopId);
+                if (!isset($out[$iso])) {
+                    continue; // PLN przy sklepie w innej walucie – nieśledzone, tylko zapis
+                }
+                if (!$res['success']) {
+                    $out[$iso]['success'] = false;
+                    $out[$iso]['message'] = $shopName . ': ' . $res['message'];
+                    continue;
+                }
+                if ($res['changed']) {
+                    $out[$iso]['changed'] = true;
+                    $changed[$res['id_currency']] = true;
+                }
+                if (!$res['skipped'] && (!isset($out[$iso]['conversion_rate']) || $idShop === $defaultShopId)) {
+                    $out[$iso]['conversion_rate'] = $conversionRate;
+                }
+            }
         }
 
-        $defaultIso = $defaultCurrency->iso_code;
-        if (!isset($ratesPln[$defaultIso])) {
-            $message = sprintf(
-                $this->l('Waluta domyślna sklepu (%s) nie jest na liście śledzonych walut - dodaj ją, aby moduł mógł przeliczać kursy.'),
-                $defaultIso
-            );
-            foreach (array_keys($ratesPln) as $iso) {
-                $out[$iso] = ['success' => false, 'message' => $message];
+        if ($changed) {
+            Currency::resetStaticCache();
+            // Powiadom moduły nasłuchujące zmian waluty (np. ps_eventbus)
+            foreach (array_keys($changed) as $idCurrency) {
+                Hook::exec('actionObjectCurrencyUpdateAfter', ['object' => new Currency($idCurrency)]);
             }
-            return $out;
-        }
-
-        $plnId = (int) Currency::getIdByIsoCode('PLN');
-        if ($plnId) {
-            $out['PLN'] = $this->writeCurrencyRateById($plnId, $ratesPln[$defaultIso]);
-        }
-
-        foreach ($ratesPln as $iso => $ratePln) {
-            if ($iso === $defaultIso) {
-                continue; // waluta domyślna ma zawsze conversion_rate = 1, nie ruszamy jej
-            }
-            $crossRate = round($ratesPln[$defaultIso] / $ratePln, 6);
-            $out[$iso] = $this->writeCurrencyRateByIso($iso, $crossRate);
         }
 
         return $out;
     }
 
     /**
-     * @return array{success: bool, conversion_rate?: float, message?: string}
+     * Zapisuje conversion_rate waluty w jednym sklepie.
+     *
+     * Zapis bezpośrednio w bazie, nie przez Currency::save() – ObjectModel
+     * nadpisuje nazwy i symbole waluty we wszystkich językach wartością
+     * z języka kontekstu. Brak czyszczenia cache Smarty: kurs nie jest
+     * częścią skompilowanych szablonów, a pełny flush przy każdym cronie
+     * wymuszał odbudowę cache wszystkich modułów i obciążał bazę.
+     *
+     * @return array{success: bool, changed: bool, skipped: bool, id_currency?: int, message?: string}
      */
-    private function writeCurrencyRateByIso(string $isoCode, float $conversionRate): array
+    private function writeShopRate(string $isoCode, int $idShop, float $conversionRate, bool $isDefaultShop): array
     {
-        $idCurrency = (int) Currency::getIdByIsoCode($isoCode);
-        if (!$idCurrency) {
-            return ['success' => false, 'message' => sprintf($this->l('Waluta %s nie istnieje w PrestaShop.'), $isoCode)];
+        $current = self::getShopCurrencyRate($isoCode, $idShop);
+        if (!$current) {
+            // Waluta nieprzypisana do tego sklepu – nie ma czego aktualizować
+            return ['success' => true, 'changed' => false, 'skipped' => true];
         }
 
-        return $this->writeCurrencyRateById($idCurrency, $conversionRate);
-    }
-
-    /**
-     * @return array{success: bool, conversion_rate?: float, message?: string}
-     */
-    private function writeCurrencyRateById(int $idCurrency, float $conversionRate): array
-    {
-        $currency = new Currency($idCurrency);
-        if (!Validate::isLoadedObject($currency)) {
-            return ['success' => false, 'message' => sprintf($this->l('Nie znaleziono waluty w PrestaShop (ID %d).'), $idCurrency)];
+        if (abs($current['conversion_rate'] - $conversionRate) < 0.0000005) {
+            return ['success' => true, 'changed' => false, 'skipped' => false, 'id_currency' => $current['id_currency']];
         }
 
-        $currency->conversion_rate = $conversionRate;
-        if (!$currency->save()) {
-            return ['success' => false, 'message' => $this->l('Błąd zapisu waluty w bazie danych.')];
+        $db = Db::getInstance();
+        $ok = $db->update(
+            'currency_shop',
+            ['conversion_rate' => $conversionRate],
+            '`id_currency` = ' . (int) $current['id_currency'] . ' AND `id_shop` = ' . (int) $idShop
+        );
+
+        // Tabela główna ps_currency trzyma kurs sklepu domyślnego
+        if ($ok && $isDefaultShop) {
+            $ok = $db->update(
+                'currency',
+                ['conversion_rate' => $conversionRate],
+                '`id_currency` = ' . (int) $current['id_currency']
+            );
         }
 
-        $this->clearCurrencyCache();
-
-        return ['success' => true, 'conversion_rate' => $conversionRate];
-    }
-
-    /**
-     * Czyści statyczny cache klasy Currency oraz cache Smarty (PS8/9).
-     */
-    private function clearCurrencyCache(): void
-    {
-        if (method_exists('Currency', 'resetStaticCache')) {
-            Currency::resetStaticCache();
+        if (!$ok) {
+            return ['success' => false, 'changed' => false, 'skipped' => false, 'message' => $this->l('Błąd zapisu waluty w bazie danych.')];
         }
-        if (method_exists('Tools', 'clearSmartyCache')) {
-            Tools::clearSmartyCache();
-        }
+
+        return ['success' => true, 'changed' => true, 'skipped' => false, 'id_currency' => $current['id_currency']];
     }
 
     private function logResult(
@@ -616,7 +731,7 @@ class NbpCurrency extends Module
      */
     public function hookActionCronJob(): void
     {
-        if (Configuration::get(self::CONFIG_KEY_AUTO_UPDATE)) {
+        if (self::getConfig(self::CONFIG_KEY_AUTO_UPDATE)) {
             $this->fetchAll();
         }
     }

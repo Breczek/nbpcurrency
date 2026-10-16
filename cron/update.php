@@ -36,7 +36,7 @@ require_once _PS_MODULE_DIR_ . 'nbpcurrency/nbpcurrency.php';
 
 // Weryfikacja tokena (porównanie odporne na timing attack)
 $token = Tools::getValue('token', '');
-$expected = Configuration::get(NbpCurrency::CONFIG_KEY_CRON_TOKEN);
+$expected = NbpCurrency::getConfig(NbpCurrency::CONFIG_KEY_CRON_TOKEN);
 
 if (!$token || !$expected || !hash_equals((string) $expected, (string) $token)) {
     http_response_code(403);

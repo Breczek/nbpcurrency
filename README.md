@@ -8,7 +8,7 @@ A PrestaShop 8/9 module that fetches currency exchange rates from the National B
 - *Why do currency-rate modules on the marketplace charge a subscription for something a free central-bank API already provides?*
 - *I only need a couple of currencies tracked (not a full 150-currency dashboard) — why is every existing option so heavy?*
 
-This module talks directly to `api.nbp.pl`, so rates are grounded in the actual published NBP tables (A/B/C) rather than a paraphrased or scraped copy — pick which currencies to track and it keeps `ps_currency.conversion_rate` in sync, on a schedule you control.
+This module talks directly to `api.nbp.pl`, so rates are grounded in the actual published NBP tables (A/B/C) rather than a paraphrased or scraped copy — pick which currencies to track and it keeps PrestaShop's conversion rates in sync (per shop in multistore), on a schedule you control.
 
 ## What's inside
 
@@ -18,6 +18,7 @@ This module talks directly to `api.nbp.pl`, so rates are grounded in the actual 
 | **`controllers/admin/AdminNbpCurrencyController.php`** | Back-office page: add/edit/remove tracked currencies, manual refresh, rate log |
 | **`cron/update.php`** | Token-authenticated HTTP endpoint for external cron, for shops without the CronJobs module |
 | **`views/templates/admin/configuration.tpl`** | Back-office configuration screen |
+| **`upgrade/`** | Upgrade scripts run by PrestaShop when updating from an older version |
 
 ### Install
 
@@ -29,6 +30,8 @@ This module talks directly to `api.nbp.pl`, so rates are grounded in the actual 
 
 - Each tracked currency is matched against one of NBP's three published tables — **A** (32 major currencies, daily mid rate), **B** (116 less-liquid currencies, weekly mid rate), **C** (13 currencies, daily bid/ask). The module validates your choice against the currency codes NBP actually publishes in each table.
 - If your shop's default currency isn't PLN, that default currency must itself be tracked — NBP always quotes against PLN, so it's the anchor used to compute every other tracked currency's cross rate.
+- **Multistore:** choose which shops get updated. Each shop is handled according to its own default currency, and the rate is written to that shop's `ps_currency_shop` row. Module settings are global, so it doesn't matter which shop's domain the cron URL is called on.
+- Rates are only written when they actually change — a run with no new NBP table (weekend, holiday, table B outside Wednesday) writes nothing, and the module never flushes the Smarty cache.
 - Enable **auto update** to refresh rates via the `actionCronJob` hook (PrestaShop's CronJobs module), or call `cron/update.php?token=...` from an external cron — the token is generated on install and shown on the configuration page.
 - Every fetch (success or failure) is written to a rate log, visible on the configuration page, for troubleshooting a missed or rejected update.
 
@@ -38,6 +41,18 @@ This module talks directly to `api.nbp.pl`, so rates are grounded in the actual 
 - **Declared compatibility:** PrestaShop 8.0+ (`ps_versions_compliancy` in `nbpcurrency.php`) — not yet manually tested on 8.x, only on 9.1.4.
 - Outbound HTTPS access to `api.nbp.pl` is required from the shop's server.
 - NBP's currency lists (which codes live in which table) are hardcoded as class constants, checked directly against the live API — table membership can change over time; open an issue if NBP adds/removes a currency and the module rejects it incorrectly.
+
+## Changelog
+
+### 1.1.0
+- **Fixed:** the module no longer calls `Tools::clearSmartyCache()` after every rate write. That flushed the whole Smarty cache and all compiled templates on every cron run, so the next storefront requests had to rebuild every module's cached output — a database load spike once a day (or several times, one per tracked currency).
+- **Fixed:** conversion rates are no longer saved through `Currency::save()`, which overwrote the currency's localized names and symbols in all languages with the value of the current context language.
+- **Fixed (multistore):** settings are stored globally and rates are written per shop. Previously the shop context of the request (e.g. the domain the cron URL was called on) decided where settings were saved and which shop's rates were updated.
+- **Added:** shop selection in the back office and per-shop conversion rates in the tracked-currency table.
+- **Changed:** unchanged NBP tables are not logged again on scheduled runs; a manual "fetch now" always logs.
+
+### 1.0.0
+- Initial release.
 
 ## Contributing
 
